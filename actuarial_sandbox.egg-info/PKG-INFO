@@ -1,0 +1,15 @@
+Metadata-Version: 2.4
+Name: actuarial-sandbox
+Version: 0.1.0
+Summary: Simplified term-life projection (mortality & lapse)
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Provides-Extra: dev
+Requires-Dist: pytest>=7.0; extra == "dev"
+Requires-Dist: pandas>=2.0; extra == "dev"
+Provides-Extra: ui
+Requires-Dist: streamlit>=1.28; extra == "ui"
+Requires-Dist: pandas>=2.0; extra == "ui"
+Requires-Dist: plotly>=5.18; extra == "ui"
+
+# actuarial-sandbox
