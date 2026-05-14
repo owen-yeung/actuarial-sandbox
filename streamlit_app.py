@@ -66,10 +66,13 @@ def _init_workflow_session() -> None:
         "exp_k_lapse": None,
         "n_full_deaths": 1082.0,
         "n_full_lapses": 1082.0,
+        "wf_step": 1,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
             st.session_state[k] = v
+    # Legacy key from older builds conflicts with Streamlit's widget binding rules.
+    st.session_state.pop("workflow_step", None)
 
 
 def _fig_decrements(policy_years: list[int], proj: Any) -> go.Figure:
@@ -147,17 +150,36 @@ def _step_labels() -> dict[int, str]:
     }
 
 
+def _wf_go_next() -> None:
+    s = min(6, int(st.session_state.get("wf_step", 1)) + 1)
+    st.session_state.wf_step = s
+    st.session_state.wf_step_radio = s
+
+
+def _wf_go_prev() -> None:
+    s = max(1, int(st.session_state.get("wf_step", 1)) - 1)
+    st.session_state.wf_step = s
+    st.session_state.wf_step_radio = s
+
+
 def _step_radio() -> int:
+    """Workflow step selector. Uses wf_step + wf_step_radio; do not assign to workflow_step (widget-owned)."""
     labels = _step_labels()
     options = list(range(1, 7))
-    return st.radio(
+    ws = max(1, min(6, int(st.session_state.get("wf_step", 1))))
+    step = st.radio(
         "Workflow step",
         options=options,
         format_func=lambda i: labels[i],
         horizontal=True,
-        key="workflow_step",
+        index=ws - 1,
+        key="wf_step_radio",
         label_visibility="collapsed",
     )
+    st.session_state.wf_step = int(step)
+    return int(step)
+
+
 def main() -> None:
     st.set_page_config(page_title="Term-life experience workflow", layout="wide")
     _init_workflow_session()
@@ -255,9 +277,9 @@ def main() -> None:
     m4.metric("PV profit", f"{proj.pv_profit:,.0f}")
     c1, c2 = st.columns(2)
     with c1:
-        st.plotly_chart(_fig_decrements(policy_years, proj), use_container_width=True)
+        st.plotly_chart(_fig_decrements(policy_years, proj), use_container_width=True, key="quick_decrements")
     with c2:
-        st.plotly_chart(_fig_cashflows(policy_years, proj), use_container_width=True)
+        st.plotly_chart(_fig_cashflows(policy_years, proj), use_container_width=True, key="quick_cashflows")
 
     st.divider()
     st.header("Actuarial workflow · Steps 1–6")
@@ -395,7 +417,7 @@ def main() -> None:
                     fig.add_trace(go.Bar(x=plot_m["attained_age"], y=plot_m["A/E"], name="Mortality A/E"))
                 fig.add_hline(y=1.0, line_dash="dash", line_color="gray")
                 fig.update_layout(title="Mortality A/E by attained age", height=360, yaxis_title="A/E")
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, use_container_width=True, key="step3_mort_ae_chart")
             with c2:
                 st.dataframe(ae_lapse_df, use_container_width=True, hide_index=True)
                 fig2 = go.Figure()
@@ -404,7 +426,7 @@ def main() -> None:
                     fig2.add_trace(go.Scatter(x=plot_l["policy_year"], y=plot_l["A/E"], mode="lines+markers", name="Lapse A/E"))
                 fig2.add_hline(y=1.0, line_dash="dash", line_color="gray")
                 fig2.update_layout(title="Lapse A/E by policy year", height=360, yaxis_title="A/E")
-                st.plotly_chart(fig2, use_container_width=True)
+                st.plotly_chart(fig2, use_container_width=True, key="step3_lapse_ae_chart")
             c3, c4 = st.columns(2)
             if agg_ae_mort is not None:
                 c3.metric("Aggregate mortality A/E", f"{agg_ae_mort:.4f}")
@@ -508,7 +530,7 @@ def main() -> None:
                 "k_mort and k_lapse, then return here to compare impact on PV profit and cash flows."
             )
             st.metric("PV profit (current sliders)", f"{proj.pv_profit:,.0f}")
-            st.plotly_chart(_fig_cashflows(policy_years, proj), use_container_width=True)
+            st.plotly_chart(_fig_cashflows(policy_years, proj), use_container_width=True, key="step6_placeholder_cf")
         else:
             assump_exp = Assumptions(
                 term_years=int(term_years),
@@ -527,7 +549,9 @@ def main() -> None:
                 st.metric("k_mort", f"{assump_curr.k_mort:.4f}")
                 st.metric("k_lapse", f"{assump_curr.k_lapse:.4f}")
                 st.metric("PV profit", f"{proj_curr.pv_profit:,.0f}")
-                st.plotly_chart(_fig_cashflows(policy_years, proj_curr), use_container_width=True)
+                st.plotly_chart(
+                    _fig_cashflows(policy_years, proj_curr), use_container_width=True, key="step6_current_cf"
+                )
             with col_b:
                 st.markdown("##### After experience update")
                 st.metric("k_mort", f"{assump_exp.k_mort:.4f}")
@@ -537,20 +561,22 @@ def main() -> None:
                     f"{proj_exp.pv_profit:,.0f}",
                     delta=f"{proj_exp.pv_profit - proj_curr.pv_profit:,.0f}",
                 )
-                st.plotly_chart(_fig_cashflows(policy_years, proj_exp), use_container_width=True)
+                st.plotly_chart(
+                    _fig_cashflows(policy_years, proj_exp), use_container_width=True, key="step6_experience_cf"
+                )
 
-            st.plotly_chart(_fig_effective_rates(int(issue_age), int(term_years), assump_exp), use_container_width=True)
+            st.plotly_chart(
+                _fig_effective_rates(int(issue_age), int(term_years), assump_exp),
+                use_container_width=True,
+                key="step6_effective_rates",
+            )
 
     st.divider()
     nprev, nnext, _ = st.columns([1, 1, 6])
     with nprev:
-        if step > 1 and st.button("← Previous step", key="nav_prev"):
-            st.session_state["workflow_step"] = step - 1
-            st.rerun()
+        st.button("← Previous step", key="nav_prev", on_click=_wf_go_prev, disabled=step <= 1)
     with nnext:
-        if step < 6 and st.button("Next step →", key="nav_next"):
-            st.session_state["workflow_step"] = step + 1
-            st.rerun()
+        st.button("Next step →", key="nav_next", on_click=_wf_go_next, disabled=step >= 6)
 
     # --- Legacy aggregate uploads (sidebar) ---
     has_mort_exp = mort_exp_upload is not None
