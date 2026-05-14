@@ -138,6 +138,34 @@ def _augment_payload_with_uploads(
         payload["lapse_csv_text"] = lapse_upload.getvalue().decode("utf-8", errors="replace")
 
 
+def _fig_decrements(policy_years: list[int], proj: Any) -> go.Figure:
+    fig = make_subplots(
+        rows=2,
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.08,
+        subplot_titles=("In-force at start of year", "Deaths and lapses during year"),
+    )
+    fig.add_trace(
+        go.Bar(x=policy_years, y=list(proj.active_start), name="Active (start)", marker_color="#2E86AB"),
+        row=1,
+        col=1,
+    )
+    fig.add_trace(
+        go.Bar(x=policy_years, y=list(proj.deaths), name="Deaths", marker_color="#A23B72"),
+        row=2,
+        col=1,
+    )
+    fig.add_trace(
+        go.Bar(x=policy_years, y=list(proj.lapses), name="Lapses", marker_color="#F18F01"),
+        row=2,
+        col=1,
+    )
+    fig.update_xaxes(title_text="Policy year", row=2, col=1)
+    fig.update_layout(height=520, showlegend=True, barmode="group", margin=dict(t=40, b=40))
+    return fig
+
+
 def _render_version_control(
     *,
     mort_mode: str,
@@ -309,31 +337,6 @@ def _render_version_control(
                 st.rerun()
             except Exception as e:
                 st.error(str(e))
-    fig = make_subplots(
-        rows=2,
-        cols=1,
-        shared_xaxes=True,
-        vertical_spacing=0.08,
-        subplot_titles=("In-force at start of year", "Deaths and lapses during year"),
-    )
-    fig.add_trace(
-        go.Bar(x=policy_years, y=list(proj.active_start), name="Active (start)", marker_color="#2E86AB"),
-        row=1,
-        col=1,
-    )
-    fig.add_trace(
-        go.Bar(x=policy_years, y=list(proj.deaths), name="Deaths", marker_color="#A23B72"),
-        row=2,
-        col=1,
-    )
-    fig.add_trace(
-        go.Bar(x=policy_years, y=list(proj.lapses), name="Lapses", marker_color="#F18F01"),
-        row=2,
-        col=1,
-    )
-    fig.update_xaxes(title_text="Policy year", row=2, col=1)
-    fig.update_layout(height=520, showlegend=True, barmode="group", margin=dict(t=40, b=40))
-    return fig
 
 
 def _fig_cashflows(policy_years: list[int], proj: Any) -> go.Figure:
