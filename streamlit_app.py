@@ -7,6 +7,8 @@ Requires: pip install -e ".[ui]"
 
 from __future__ import annotations
 
+import io
+import json
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +29,18 @@ from term_life.policy_experience import (
 from term_life.projection import Assumptions, Portfolio, project_term_life
 from term_life.simulated_experience import demo_policy_csv_text, generate_policy_level_term_experience
 from term_life.tables import stylized_base_lapse_by_duration, stylized_base_mortality_table
+from term_life.version_store import (
+    FORMAT_TAG,
+    MAX_SHARE_URL_CHARS,
+    VersionGraph,
+    apply_payload_to_session,
+    bundle_for_share,
+    collect_payload_from_session,
+    decode_bundle,
+    encode_bundle,
+    graph_from_bundle,
+    share_token_fits_url,
+)
 
 BUNDLED_POLICY_CSV = Path(__file__).resolve().parent / "data/simulated_experience/policy_level_term_cohort.csv"
 
@@ -75,7 +89,226 @@ def _init_workflow_session() -> None:
     st.session_state.pop("workflow_step", None)
 
 
-def _fig_decrements(policy_years: list[int], proj: Any) -> go.Figure:
+def _init_version_graph() -> None:
+    if "vc_graph" not in st.session_state or not isinstance(st.session_state.vc_graph, VersionGraph):
+        st.session_state.vc_graph = VersionGraph()
+    if "vc_head_id" not in st.session_state:
+        st.session_state.vc_head_id = None
+
+
+def _maybe_load_vc_from_url() -> None:
+    """Import graph + apply focused snapshot from ?vc=… then strip param and rerun."""
+    _init_version_graph()
+    if "vc" not in st.query_params:
+        return
+    token = st.query_params["vc"]
+    if isinstance(token, list):
+        token = token[0] if token else ""
+    token = str(token).strip()
+    if not token:
+        return
+    try:
+        bundle = decode_bundle(token)
+        graph, focus = graph_from_bundle(bundle)
+        st.session_state.vc_graph = graph
+        st.session_state.vc_head_id = focus
+        apply_payload_to_session(st.session_state, graph.nodes[focus].payload)
+    except Exception as e:
+        st.session_state["_vc_url_error"] = str(e)
+    try:
+        del st.query_params["vc"]
+    except Exception:
+        try:
+            st.query_params.clear()
+        except Exception:
+            pass
+    st.rerun()
+
+
+def _augment_payload_with_uploads(
+    payload: dict[str, Any],
+    mort_mode: str,
+    mort_upload: Any,
+    lapse_mode: str,
+    lapse_upload: Any,
+) -> None:
+    if mort_mode == "Upload CSV (merge)" and mort_upload is not None:
+        payload["mort_csv_text"] = mort_upload.getvalue().decode("utf-8", errors="replace")
+    if lapse_mode == "Upload CSV (merge)" and lapse_upload is not None:
+        payload["lapse_csv_text"] = lapse_upload.getvalue().decode("utf-8", errors="replace")
+
+
+def _render_version_control(
+    *,
+    mort_mode: str,
+    mort_upload: Any,
+    lapse_mode: str,
+    lapse_upload: Any,
+) -> None:
+    _init_version_graph()
+    graph: VersionGraph = st.session_state.vc_graph
+
+    err_show = st.session_state.pop("_vc_url_error", None)
+    if err_show:
+        st.error(f"Could not load version link: {err_show}")
+
+    with st.expander("Version control & sharing (this browser session only)", expanded=False):
+        st.markdown(
+            "Save **named snapshots** with notes, build a **DAG** of revisions, and **share** via URL or JSON. "
+            "Another tab can open the link, edit assumptions, and save a **new child** snapshot."
+        )
+
+        if graph.nodes:
+            sorted_ids = sorted(graph.nodes.keys(), key=lambda sid: graph.nodes[sid].created_at)
+            try:
+                st.graphviz_chart(graph.dot_graph(highlight_id=st.session_state.get("vc_head_id")))
+            except Exception:
+                st.caption("(Graph preview unavailable in this environment.)")
+            rows = []
+            for sid in sorted_ids:
+                sn = graph.nodes[sid]
+                rows.append(
+                    {
+                        "id": sid,
+                        "parent": sn.parent_id or "—",
+                        "name": sn.name,
+                        "notes": sn.notes[:60] + ("…" if len(sn.notes) > 60 else ""),
+                        "created": sn.created_at,
+                    }
+                )
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+        st.subheader("Save new snapshot")
+        col_a, col_b = st.columns(2)
+        with col_a:
+            snap_name = st.text_input("Snapshot name", key="vc_snap_name", placeholder="e.g. Q4 base case")
+        with col_b:
+            snap_notes = st.text_input("Version notes", key="vc_snap_notes", placeholder="Like a commit message")
+
+        parent_options = [("(root — no parent)", None)]
+        for sid, sn in sorted(graph.nodes.items(), key=lambda kv: kv[1].created_at):
+            parent_options.append((f"{sn.name} ({sid})", sid))
+        default_ix = 0
+        hid = st.session_state.get("vc_head_id")
+        for i, (_, pid) in enumerate(parent_options):
+            if pid == hid:
+                default_ix = i
+                break
+        parent_label = st.selectbox(
+            "Parent snapshot (new node branches from here)",
+            options=[x[0] for x in parent_options],
+            index=default_ix,
+            key="vc_parent_pick",
+        )
+        parent_id = parent_options[[x[0] for x in parent_options].index(parent_label)][1]
+
+        if st.button("Save snapshot from current UI", type="primary", key="vc_save_snap"):
+            if not (snap_name or "").strip():
+                st.warning("Enter a snapshot name.")
+            else:
+                payload = collect_payload_from_session(st.session_state)
+                _augment_payload_with_uploads(payload, mort_mode, mort_upload, lapse_mode, lapse_upload)
+                graph.add_snapshot(
+                    parent_id=parent_id,
+                    name=(snap_name or "").strip(),
+                    notes=(snap_notes or "").strip(),
+                    payload=payload,
+                )
+                st.session_state.vc_head_id = graph.head_id
+                st.success(f"Saved snapshot **{graph.head_id}** — {snap_name.strip()}.")
+                st.rerun()
+
+        st.subheader("Load snapshot into UI")
+        if not graph.nodes:
+            st.caption("No snapshots yet.")
+        else:
+            sorted_ids = sorted(graph.nodes.keys(), key=lambda sid: graph.nodes[sid].created_at)
+            load_labels = [f"{graph.nodes[sid].name} ({sid}) — {graph.nodes[sid].created_at}" for sid in sorted_ids]
+            pick = st.selectbox(
+                "Choose snapshot", options=range(len(sorted_ids)), format_func=lambda i: load_labels[i], key="vc_load_pick"
+            )
+            if st.button("Load selected into UI", key="vc_load_btn"):
+                sid = sorted_ids[pick]
+                apply_payload_to_session(st.session_state, graph.nodes[sid].payload)
+                st.session_state.vc_head_id = sid
+                st.success(f"Loaded **{sid}** into the form.")
+                st.rerun()
+
+        st.subheader("Share via link (localhost)")
+        if graph.nodes:
+            sorted_ids = sorted(graph.nodes.keys(), key=lambda sid: graph.nodes[sid].created_at)
+            share_labels = [f"{graph.nodes[sid].name} ({sid})" for sid in sorted_ids]
+            si = st.selectbox(
+                "Snapshot to encode in link",
+                options=range(len(sorted_ids)),
+                format_func=lambda i: share_labels[i],
+                key="vc_share_pick",
+            )
+            sid = sorted_ids[si]
+            bundle = bundle_for_share(graph, sid)
+            token = encode_bundle(bundle)
+            if share_token_fits_url(token):
+                rel = f"?vc={token}"
+                st.code(rel, language=None)
+                st.caption("Append the line above to your app URL (e.g. `http://127.0.0.1:8501` + line).")
+            else:
+                st.warning(
+                    f"Encoded link is **{len(token)}** chars (limit {MAX_SHARE_URL_CHARS}). Use **JSON export** below and send the file, "
+                    "or reduce policy CSV size."
+                )
+                st.text_area("Encoded token (for short payloads / manual copy)", token, height=120, key="vc_tok_big")
+
+        st.subheader("Share via JSON file")
+        if graph.nodes:
+            sorted_ids = sorted(graph.nodes.keys(), key=lambda sid: graph.nodes[sid].created_at)
+            json_labels = [f"{graph.nodes[sid].name} ({sid})" for sid in sorted_ids]
+            si2 = st.selectbox(
+                "Snapshot for JSON bundle",
+                options=range(len(sorted_ids)),
+                format_func=lambda i: json_labels[i],
+                key="vc_json_pick",
+            )
+            share_id = sorted_ids[si2]
+            jbundle = bundle_for_share(graph, share_id)
+            jst = json.dumps(jbundle, indent=2)
+            st.download_button(
+                "Download JSON bundle",
+                jst,
+                file_name=f"snapshot-{share_id}.json",
+                mime="application/json",
+                key="vc_dl_json",
+            )
+
+        st.subheader("Import JSON bundle (replace graph & load focus)")
+        pasted = st.text_area("Paste JSON bundle here", height=160, key="vc_paste_json")
+        if st.button("Apply pasted JSON", key="vc_apply_json"):
+            try:
+                data = json.loads(pasted.strip() or "{}")
+                if data.get("format") != FORMAT_TAG:
+                    raise ValueError(f"Expected format {FORMAT_TAG!r}.")
+                g2, focus = graph_from_bundle(data)
+                st.session_state.vc_graph = g2
+                st.session_state.vc_head_id = focus
+                apply_payload_to_session(st.session_state, g2.nodes[focus].payload)
+                st.success("Imported graph and loaded focus snapshot.")
+                st.rerun()
+            except Exception as e:
+                st.error(str(e))
+
+        up_json = st.file_uploader("Or upload JSON bundle", type=["json"], key="vc_up_json")
+        if up_json is not None and st.button("Apply uploaded JSON", key="vc_apply_up_json"):
+            try:
+                data = json.loads(up_json.getvalue().decode("utf-8"))
+                if data.get("format") != FORMAT_TAG:
+                    raise ValueError(f"Expected format {FORMAT_TAG!r}.")
+                g2, focus = graph_from_bundle(data)
+                st.session_state.vc_graph = g2
+                st.session_state.vc_head_id = focus
+                apply_payload_to_session(st.session_state, g2.nodes[focus].payload)
+                st.success("Imported graph and loaded focus snapshot.")
+                st.rerun()
+            except Exception as e:
+                st.error(str(e))
     fig = make_subplots(
         rows=2,
         cols=1,
@@ -183,6 +416,8 @@ def _step_radio() -> int:
 def main() -> None:
     st.set_page_config(page_title="Term-life experience workflow", layout="wide")
     _init_workflow_session()
+    _init_version_graph()
+    _maybe_load_vc_from_url()
     st.title("Term-life model · experience workflow")
     st.caption(
         "Guided Steps 1–6: from policy-level experience to credibility-weighted parameters and impact on projections."
@@ -226,18 +461,40 @@ def main() -> None:
         cred_w = st.slider("Legacy: credibility w for suggest_k_mort", 0.0, 1.0, 1.0, 0.05, key="cred_w")
 
     try:
+        if mort_mode == "Built-in stylized":
+            st.session_state.pop("vc_mort_csv_text", None)
+        if lapse_mode == "Built-in stylized":
+            st.session_state.pop("vc_lapse_csv_text", None)
+
         if mort_mode == "Upload CSV (merge)" and mort_upload is not None:
             mortality_table = mortality_table_from_csv(pd.read_csv(mort_upload), merge_with_stylized=True)
+            st.session_state.pop("vc_mort_csv_text", None)
+        elif st.session_state.get("vc_mort_csv_text"):
+            mortality_table = mortality_table_from_csv(
+                pd.read_csv(io.StringIO(st.session_state.vc_mort_csv_text)), merge_with_stylized=True
+            )
         else:
             mortality_table = base_mort
 
         if lapse_mode == "Upload CSV (merge)" and lapse_upload is not None:
             lapse_curve = lapse_curve_from_csv(pd.read_csv(lapse_upload), int(term_years), merge_with_stylized=True)
+            st.session_state.pop("vc_lapse_csv_text", None)
+        elif st.session_state.get("vc_lapse_csv_text"):
+            lapse_curve = lapse_curve_from_csv(
+                pd.read_csv(io.StringIO(st.session_state.vc_lapse_csv_text)), int(term_years), merge_with_stylized=True
+            )
         else:
             lapse_curve = stylized_base_lapse_by_duration(int(term_years))
     except Exception as e:
         st.error(f"Could not load base assumptions: {e}")
         st.stop()
+
+    _render_version_control(
+        mort_mode=mort_mode,
+        mort_upload=mort_upload,
+        lapse_mode=lapse_mode,
+        lapse_upload=lapse_upload,
+    )
 
     max_age = int(issue_age) + int(term_years) - 1
     missing_ages = [x for x in range(int(issue_age), max_age + 1) if x not in mortality_table.rates]
